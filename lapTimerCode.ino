@@ -1,115 +1,193 @@
 #include <SPI.h>
 #include <RF24.h>
 
-const uint8_t TRIG_PIN  = 3;   // this pins need to be finalized i just used dummy values here
-const uint8_t ECHO_PIN  = 4;
+// ---------- CONFIG ----------
+#define BAUD 9600
+#define USE_RADIO 1          // set to 0 to ignore RF24 (sensor-only debug)
+#define DEBUG_PRINT_EVERY_MS 250
+#define THRESHOLD_CM 30.0f
+#define PING_INTERVAL_MS 60
+
+// Pins (yours)
+const uint8_t TRIG_PIN = 4;
+const uint8_t ECHO_PIN = 3;
 
 const uint8_t CE_PIN   = 9;
 const uint8_t CSN_PIN  = 10;
+
+// Radio
+#if USE_RADIO
 RF24 radio(CE_PIN, CSN_PIN);
-
-// found the address!! ("FGHIJ"):contentReference[oaicite:0]{index=0}
-const byte ADDRESS[6] = "FGHIJ";
-
-// i need to find a decent can id port that they want to integrate into the dash
-const uint16_t CAN_ID = 5000;
-
-// nRF24 channel and payload length to match the receiver
+const uint8_t ADDRESS[5] = { 'F','G','H','I','J' };
 const uint8_t RF_CHANNEL = 2;
 const uint8_t PAYLOAD_LEN = 32;
+const uint16_t CAN_ID = 5000; // 0x1388
+#endif
 
-const float DETECTION_THRESHOLD_CM = 30.0; // adjust once we start testing
-const float SENSOR_ZONE_LENGTH_M   = 0.30; // length of the zone used for speed
+// Lap timing / speed
+const float SENSOR_ZONE_LENGTH_M = 0.30f;
 
-bool timerStarted     = false;
-uint32_t lapStartTime = 0;
-int      lapCount     = 0;
-uint32_t bestLapTime  = 0;
+bool     timerStarted   = false;
+uint32_t lapStartMS     = 0;
+uint32_t bestLapMS      = 0;
+int      lapCount       = 0;
 
 bool     prevCarPresent = false;
-uint32_t carEnterMicros = 0;
-uint32_t carExitMicros  = 0;
+uint32_t carEnterUs     = 0;
+uint32_t carExitUs      = 0;
 
-// trigger the HC‑SR04 and return distance in cm
+// Onboard LED (UNO = 13)
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 13
+#endif
+
+// ---- Robust ultrasonic read ----
 float measureDistanceCM() {
   digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
+  delayMicroseconds(3);
   digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
+  delayMicroseconds(12);
   digitalWrite(TRIG_PIN, LOW);
-  // duration is round‑trip time so divide by 2 and multiply by sound speed to get distance:contentReference[oaicite:1]{index=1}.
-  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 20000UL);
-  float distance_cm = (duration * 0.0343f) / 2.0f;
-  return distance_cm;
+
+  // Wait for rising edge with timeout
+  unsigned long t0 = micros();
+  while (digitalRead(ECHO_PIN) == LOW) {
+    if (micros() - t0 > 30000UL) return 1e9f; // "far"
+  }
+  // Measure HIGH width (cap at ~5 m)
+  unsigned long start = micros();
+  while (digitalRead(ECHO_PIN) == HIGH) {
+    if (micros() - start > 30000UL) return 1e9f;
+  }
+  unsigned long duration = micros() - start;
+  return (duration * 0.0343f) * 0.5f;  // cm
 }
 
 void setup() {
-  Serial.begin(9600);
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // init radio and receiver
-  radio.begin();
-  radio.setChannel(RF_CHANNEL);            // same channel as receiver
+  // Keep SS as OUTPUT so SPI stays master
+  pinMode(10, OUTPUT);
+
+  Serial.begin(BAUD);
+  delay(200);
+
+  // Boot banner
+  Serial.println(F("\n=== Lap TX w/ HEX payload (diag) ==="));
+  Serial.print(F("TRIG=")); Serial.print(TRIG_PIN);
+  Serial.print(F("  ECHO=")); Serial.println(ECHO_PIN);
+
+#if USE_RADIO
+  Serial.print(F("RF CE=")); Serial.print(CE_PIN);
+  Serial.print(F("  CSN=")); Serial.println(CSN_PIN);
+  Serial.println(F("Init RF24..."));
+  if (!radio.begin()) Serial.println(F("radio.begin() FAILED (check power/CE/CSN/SPI/MISO)."));
+  radio.setChannel(RF_CHANNEL);
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_1MBPS);
-  radio.openWritingPipe(ADDRESS);          // write to the receiver's address
-  radio.setPayloadSize(PAYLOAD_LEN);       // 32‑byte payloads
-  radio.stopListening();                   // transmitter mode:contentReference[oaicite:2]{index=2}
+  radio.setRetries(5, 15);
+  radio.setPayloadSize(PAYLOAD_LEN);
+  radio.openWritingPipe(ADDRESS);
+  radio.stopListening();
+  Serial.println(F("RF24 configured."));
+#else
+  Serial.println(F("RF24 disabled (USE_RADIO=0). Sensor-only debug."));
+#endif
+
+  // Blink 3× at boot
+  for (int i = 0; i < 3; i++) { digitalWrite(LED_BUILTIN, HIGH); delay(120); digitalWrite(LED_BUILTIN, LOW); delay(120); }
 }
 
 void loop() {
-  float distance = measureDistanceCM();
-  bool carPresent = (distance < DETECTION_THRESHOLD_CM);
-  uint32_t nowMicros = micros();
+  static uint32_t lastBlink = 0, lastDbg = 0;
+  static bool ledState = false;  // <-- FIX: track LED state
 
-  if (!prevCarPresent && carPresent) {
-    carEnterMicros = nowMicros;
+  // Heartbeat LED every ~250 ms
+  if (millis() - lastBlink >= 250) {
+    ledState = !ledState;
+    digitalWrite(LED_BUILTIN, ledState);
+    lastBlink = millis();
   }
 
-  if (prevCarPresent && !carPresent) {
-    carExitMicros = nowMicros;
+  float d = measureDistanceCM();
+  bool carPresent = (d < THRESHOLD_CM);
+  uint32_t nowMs = millis();
+  uint32_t nowUs = micros();
 
+  // periodic debug
+  if (millis() - lastDbg >= DEBUG_PRINT_EVERY_MS) {
+    Serial.print(F("d="));
+    if (d > 1e8f) Serial.print(F("far"));
+    else Serial.print(d, 1);
+    Serial.print(F(" cm  car="));
+    Serial.println(carPresent ? F("1") : F("0"));
+    lastDbg = millis();
+  }
+
+  // Rising edge
+  if (!prevCarPresent && carPresent) {
+    carEnterUs = nowUs;
     if (!timerStarted) {
-      lapStartTime  = millis();
-      timerStarted  = true;
-      lapCount      = 0;
-      bestLapTime   = 0;
+      timerStarted = true;
+      lapStartMS   = nowMs;
+      lapCount     = 0;
+      bestLapMS    = 0;
+      Serial.println(F("START stopwatch"));
     } else {
-      uint32_t currentMillis = millis();
-      uint32_t lapTimeMS     = currentMillis - lapStartTime;
-      lapStartTime           = currentMillis;
+      Serial.println(F("ENTER"));
+    }
+  }
+
+  // Falling edge -> record lap
+  if (prevCarPresent && !carPresent) {
+    carExitUs = nowUs;
+
+    if (timerStarted) {
+      uint32_t lapMS = nowMs - lapStartMS;
+      lapStartMS = nowMs;
       lapCount++;
+      if (bestLapMS == 0 || lapMS < bestLapMS) bestLapMS = lapMS;
 
-      if (bestLapTime == 0 || lapTimeMS < bestLapTime) {
-        bestLapTime = lapTimeMS;
+      // speed (safe)
+      uint32_t crossUs = carExitUs - carEnterUs;
+      float mph = 0.0f;
+      if (crossUs > 0) {
+        float secs = crossUs / 1e6f;
+        float mps  = SENSOR_ZONE_LENGTH_M / secs;
+        mph        = mps * 2.23694f;
       }
+      long mphx100 = (long)(mph * 100.0f + 0.5f);
 
-      // est. speed and record in mph (two decimal places)
-      uint32_t crossTimeUS = carExitMicros - carEnterMicros;
-      float crossTimeSec   = crossTimeUS / 1e6f;
-      float speed_mps      = SENSOR_ZONE_LENGTH_M / crossTimeSec;
-      float speed_mph      = speed_mps * 2.23694f;
-      long mphTimes100     = (long)(speed_mph * 100.0f + 0.5f);
-
-      // encode lap time (ms) in the lower 32 bits and speed (mph*100) in the upper 32 bits
-      // i might need to change the packet scheme but who knows ig
-      uint64_t packedData = ((uint64_t)mphTimes100 << 32) | (uint64_t)lapTimeMS;
-
-      // convert the 64‑bit value to a 16‑digit hex string
+      // pack 64b: [63:32]=mph*100, [31:0]=lapMS  -> 16 hex chars
+      uint64_t packed = ((uint64_t)(uint32_t)mphx100 << 32) | (uint32_t)lapMS;
+      uint32_t hi = (uint32_t)(packed >> 32);
+      uint32_t lo = (uint32_t)(packed & 0xFFFFFFFFUL);
       char dataHex[17];
-      snprintf(dataHex, sizeof(dataHex), "%016llX", (unsigned long long)packedData);
+      snprintf(dataHex, sizeof(dataHex), "%08lX%08lX", (unsigned long)hi, (unsigned long)lo);
 
-      // build packet: "CAN_ID_HEX,DATA_HEX" but they might not want hex we'll see
       char packet[32];
-      snprintf(packet, sizeof(packet), "%X,%s", CAN_ID, dataHex);
+      snprintf(packet, sizeof(packet), "%X,%s", (unsigned)CAN_ID, dataHex);
 
-      // send and log
-      radio.write(packet, strlen(packet) + 1);
-      Serial.print("TX: "); Serial.println(packet);
+#if USE_RADIO
+      bool ok = radio.write(packet, strlen(packet) + 1);
+      Serial.print(F("LAP ")); Serial.print(lapCount);
+      Serial.print(F(": ")); Serial.print(lapMS); Serial.print(F(" ms  best=")); Serial.print(bestLapMS);
+      Serial.print(F(" ms  mph=")); Serial.print(mph, 2);
+      Serial.print(F("  TX=")); Serial.print(ok ? F("OK") : F("FAIL"));
+      Serial.print(F("  -> ")); Serial.println(packet);
+#else
+      Serial.print(F("LAP ")); Serial.print(lapCount);
+      Serial.print(F(": ")); Serial.print(lapMS); Serial.print(F(" ms  best=")); Serial.print(bestLapMS);
+      Serial.print(F(" ms  mph=")); Serial.print(mph, 2);
+      Serial.print(F("  (RF disabled)  -> ")); Serial.println(packet);
+#endif
     }
   }
 
   prevCarPresent = carPresent;
-  delay(30);
+  delay(PING_INTERVAL_MS);
 }
